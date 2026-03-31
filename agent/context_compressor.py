@@ -341,32 +341,55 @@ Target ~{summary_budget} tokens. Be specific — include file paths, command out
 
 Write only the summary body. Do not include any preamble or prefix."""
 
-        try:
-            call_kwargs = {
-                "task": "compression",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": summary_budget * 2,
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
-            }
-            if self.summary_model:
-                call_kwargs["model"] = self.summary_model
-            response = call_llm(**call_kwargs)
-            content = response.choices[0].message.content
+        def _coerce_summary_content(resp) -> str:
+            content = resp.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
-            summary = content.strip()
-            # Store for iterative updates on next compaction
+            return (content or "").strip()
+
+        call_kwargs = {
+            "task": "compression",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": summary_budget * 2,
+            # timeout resolved from auxiliary.compression.timeout config by call_llm
+        }
+
+        try:
+            # Attempt 1: honor configured summary_model override when present.
+            attempt_kwargs = dict(call_kwargs)
+            if self.summary_model:
+                attempt_kwargs["model"] = self.summary_model
+
+            response = call_llm(**attempt_kwargs)
+            summary = _coerce_summary_content(response)
             self._previous_summary = summary
             return self._with_summary_prefix(summary)
+
         except RuntimeError:
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary.")
+            logging.warning(
+                "Context compression: no provider available for summary. "
+                "Middle turns will be dropped without summary."
+            )
             return None
+
         except Exception as e:
+            # Attempt 2 (robustness): if the summary model/provider was misconfigured
+            # (e.g. google/* model routed to a Codex endpoint), retry using the
+            # main provider/model to avoid silent compaction failure.
             logging.warning("Failed to generate context summary: %s", e)
-            return None
+            try:
+                retry_kwargs = dict(call_kwargs)
+                retry_kwargs["provider"] = "main"
+                retry_kwargs["model"] = self.model
+                response = call_llm(**retry_kwargs)
+                summary = _coerce_summary_content(response)
+                self._previous_summary = summary
+                return self._with_summary_prefix(summary)
+            except Exception as e2:
+                logging.warning("Context summary retry (provider=main) failed: %s", e2)
+                return None
 
     @staticmethod
     def _with_summary_prefix(summary: str) -> str:
@@ -610,6 +633,20 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize)
+
+        # If we couldn't generate a summary, do NOT fail silently. Insert a short
+        # warning marker so both the user and the next assistant understand why
+        # continuity may degrade (e.g., misconfigured summary model/provider).
+        if not summary:
+            warning = (
+                "[CONTEXT COMPACTION WARNING] Failed to generate a compaction summary. "
+                "Earlier turns may have been dropped without a summary, which can lead "
+                "to inconsistent answers or lost context. Fix by configuring a summary "
+                "model/provider supported by your main endpoint (e.g. set "
+                "compression.summary_provider/model appropriately, or set "
+                "auxiliary.compression.provider=main)."
+            )
+            summary = self._with_summary_prefix(warning)
 
         # Phase 4: Assemble compressed message list
         compressed = []

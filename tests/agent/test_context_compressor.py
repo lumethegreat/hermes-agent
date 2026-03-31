@@ -157,6 +157,55 @@ class TestGenerateSummaryNoneContent:
         assert len(result) < len(msgs)
 
 
+class TestSummaryRobustFallback:
+    def test_generate_summary_retries_with_main_provider(self):
+        """If the summary model/provider is misconfigured, we retry with provider=main."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: recovered"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="gpt-5.2",
+                quiet_mode=True,
+                summary_model_override="google/gemini-3-flash-preview",
+            )
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        def side_effect(**kwargs):
+            # First attempt fails (simulating unsupported model on endpoint)
+            if kwargs.get("provider") != "main":
+                raise Exception("model is not supported")
+            return mock_response
+
+        with patch("agent.context_compressor.call_llm", side_effect=side_effect) as mocked:
+            summary = c._generate_summary(messages)
+
+        assert isinstance(summary, str)
+        assert summary.startswith(SUMMARY_PREFIX)
+        assert mocked.call_count == 2
+        assert mocked.call_args_list[1].kwargs.get("provider") == "main"
+        assert mocked.call_args_list[1].kwargs.get("model") == "gpt-5.2"
+
+    def test_compress_inserts_warning_summary_when_generate_summary_returns_none(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(12)]
+        with patch.object(c, "_generate_summary", return_value=None):
+            result = c.compress(msgs)
+
+        contents = [m.get("content", "") for m in result]
+        assert any(
+            (isinstance(x, str) and x.startswith(SUMMARY_PREFIX) and "CONTEXT COMPACTION WARNING" in x)
+            for x in contents
+        )
+
+
 class TestNonStringContent:
     """Regression: content as dict (e.g., llama.cpp tool calls) must not crash."""
 
